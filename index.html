@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>3MF Box Splitter</title>
+<style>
+:root{--bg:#14161a;--panel:#1d2026;--line:#2e333c;--fg:#e6e8ec;--dim:#9aa1ad;--acc:#4f9dff}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+#app{display:flex;height:100%}
+#view{flex:1;position:relative;min-width:0}
+#view canvas{display:block}
+#side{width:320px;flex:none;background:var(--panel);border-left:1px solid var(--line);overflow-y:auto;padding:16px}
+h1{font-size:15px;margin:0 0 4px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:20px 0 8px;font-weight:600}
+p.sub{color:var(--dim);margin:0 0 16px}
+#drop{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;
+  background:rgba(20,22,26,.92);border:2px dashed var(--line);z-index:5;cursor:pointer}
+#drop.hide{display:none}
+#drop.over{border-color:var(--acc);background:rgba(79,157,255,.08)}
+#drop div{max-width:340px;color:var(--dim)}
+#drop b{display:block;color:var(--fg);font-size:16px;margin-bottom:6px}
+label.rng{display:block;margin:0 0 10px}
+label.rng span{display:flex;justify-content:space-between;color:var(--dim);font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;accent-color:var(--acc)}
+button{width:100%;padding:9px 12px;margin:0 0 8px;background:var(--acc);color:#08101c;border:0;border-radius:6px;
+  font:inherit;font-weight:600;cursor:pointer}
+button.sec{background:#2b313a;color:var(--fg)}
+button:disabled{opacity:.4;cursor:default}
+.row{display:flex;gap:8px}
+.row button{margin:0}
+#legend{display:flex;flex-wrap:wrap;gap:6px}
+#legend i{display:flex;align-items:center;gap:5px;font-style:normal;color:var(--dim);font-size:11px}
+#legend b{width:12px;height:12px;border-radius:3px;border:1px solid #0006}
+#log{white-space:pre-wrap;color:var(--dim);font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin-top:14px}
+a{color:var(--acc)}
+kbd{background:#2b313a;border-radius:3px;padding:1px 5px;font:11px ui-monospace,monospace}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <div id="drop"><div><b>Drop a .3mf file here</b>or click to choose one.<br><br>
+      Everything runs in your browser — nothing is uploaded.</div></div>
+  </div>
+  <div id="side">
+    <h1>3MF Box Splitter</h1>
+    <p class="sub">Cut a model into two printable halves with an axis-aligned box. Paint colours are preserved.</p>
+
+    <h2>Crop box</h2>
+    <div id="sliders"></div>
+    <label style="display:block;margin:12px 0"><input type="checkbox" id="clip"> Preview: hide outside of box</label>
+    <button class="sec" id="reset" disabled>Reset box to model bounds</button>
+
+    <h2>Export</h2>
+    <div class="row">
+      <button id="dlIn" disabled>Inside .3mf</button>
+      <button id="dlOut" disabled>Outside .3mf</button>
+    </div>
+
+    <h2>Paint colours</h2>
+    <div id="legend"></div>
+
+    <h2>View</h2>
+    <p class="sub" style="margin:0">Drag to orbit · wheel to zoom · <kbd>shift</kbd>+drag or right-drag to pan</p>
+
+    <div id="log"></div>
+  </div>
+</div>
+<input type="file" id="file" accept=".3mf" hidden>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/fflate/0.8.2/umd/index.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const log = m => { $('#log').textContent = m; };
+
+/* ---------- 3MF reading ---------- */
+
+const NS_C = 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02';
+
+function parse3mf(buf) {
+  const files = fflate.unzipSync(new Uint8Array(buf));
+  const text = n => files[n] ? fflate.strFromU8(files[n]) : null;
+  const dom = new DOMParser();
+
+  // Every <object> in every .model file, keyed by "<file>#<id>".
+  const objects = new Map();
+  for (const name of Object.keys(files)) {
+    if (!name.toLowerCase().endsWith('.model')) continue;
+    const doc = dom.parseFromString(text(name), 'application/xml');
+    for (const o of doc.getElementsByTagNameNS(NS_C, 'object'))
+      objects.set(name.replace(/^\//, '') + '#' + o.getAttribute('id'), o);
+  }
+
+  const verts = [];            // flat xyz, world space
+  const tris  = [];            // {a,b,c, pc}
+  const M_ID  = [1,0,0, 0,1,0, 0,0,1, 0,0,0];
+
+  const mul = (A, B) => {      // 3MF row-vector convention: p' = p*A + t
+    const r = new Array(12);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+      r[i*3+j] = A[i*3]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+    for (let j = 0; j < 3; j++)
+      r[9+j] = A[9]*B[j] + A[10]*B[3+j] + A[11]*B[6+j] + B[9+j];
+    return r;
+  };
+  const parseM = s => s ? s.trim().split(/\s+/).map(Number) : M_ID;
+
+  function emit(file, id, M, depth) {
+    if (depth > 8) return;
+    const o = objects.get(file + '#' + id);
+    if (!o) return;
+    const mesh = o.getElementsByTagNameNS(NS_C, 'mesh')[0];
+    if (mesh) {
+      const base = verts.length / 3;
+      for (const v of mesh.getElementsByTagNameNS(NS_C, 'vertex')) {
+        const x = +v.getAttribute('x'), y = +v.getAttribute('y'), z = +v.getAttribute('z');
+        verts.push(x*M[0] + y*M[3] + z*M[6] + M[9],
+                   x*M[1] + y*M[4] + z*M[7] + M[10],
+                   x*M[2] + y*M[5] + z*M[8] + M[11]);
+      }
+      for (const t of mesh.getElementsByTagNameNS(NS_C, 'triangle'))
+        tris.push({ a: base + +t.getAttribute('v1'), b: base + +t.getAttribute('v2'),
+                    c: base + +t.getAttribute('v3'), pc: t.getAttribute('paint_color') || '' });
+    }
+    for (const c of o.getElementsByTagNameNS(NS_C, 'component')) {
+      const path = (c.getAttribute('p:path') || c.getAttributeNS(
+        'http://schemas.microsoft.com/3dmanufacturing/production/2015/06', 'path') || file).replace(/^\//, '');
+      emit(path, c.getAttribute('objectid'), mul(parseM(c.getAttribute('transform')), M), depth + 1);
+    }
+  }
+
+  const root = '3D/3dmodel.model';
+  const rdoc = dom.parseFromString(text(root) || '<model/>', 'application/xml');
+  for (const it of rdoc.getElementsByTagNameNS(NS_C, 'item'))
+    emit(root, it.getAttribute('objectid'), parseM(it.getAttribute('transform')), 0);
+
+  if (!tris.length) throw new Error('No mesh found in this 3MF.');
+
+  let palette = ['#4a86c8'];
+  const ps = text('Metadata/project_settings.config');
+  if (ps) try { palette = JSON.parse(ps).filament_colour || palette; } catch (e) {}
+
+  return { verts, tris, palette, files };
+}
+
+/* ---------- paint code -> display colour ----------
+   Bambu encodes multi-material painting in `paint_color` as an opaque
+   subdivision string. We do not re-encode it, so exports keep it verbatim;
+   for the preview we just map each distinct code onto a filament colour,
+   most-used first, with unpainted triangles taking filament 1. */
+
+function colourMap(tris, palette) {
+  const n = new Map();
+  for (const t of tris) if (t.pc) n.set(t.pc, (n.get(t.pc) || 0) + 1);
+  const order = [...n.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+  const map = new Map([['', palette[0] || '#4a86c8']]);
+  order.forEach((code, i) => map.set(code, palette[(i + 1) % palette.length] || '#888888'));
+  return { map, order };
+}
+
+/* ---------- geometry: exact plane split ---------- */
+
+// Split a triangle by the plane `axis ax = d`.
+// Returns fragments, each entirely on one side. Vertices are [x,y,z] arrays.
+function splitByPlane(P, ax, d) {
+  const sd = P.map(p => p[ax] - d);
+  const pos = sd.filter(v => v > 1e-9).length, neg = sd.filter(v => v < -1e-9).length;
+  if (!pos || !neg) return [P];                       // no crossing
+  const lerp = (A, B) => {
+    const t = (d - A[ax]) / (B[ax] - A[ax]);
+    return [A[0] + (B[0]-A[0])*t, A[1] + (B[1]-A[1])*t, A[2] + (B[2]-A[2])*t];
+  };
+  // rotate so the lone vertex on its own side is first
+  let k = 0;
+  for (let i = 0; i < 3; i++) {
+    const a = sd[i], b = sd[(i+1)%3], c = sd[(i+2)%3];
+    if ((a > 0 && b <= 0 && c <= 0) || (a < 0 && b >= 0 && c >= 0)) { k = i; break; }
+  }
+  const A = P[k], B = P[(k+1)%3], C = P[(k+2)%3];
+  const AB = lerp(A, B), AC = lerp(A, C);
+  return [[A, AB, AC], [AB, B, C], [AB, C, AC]];
+}
+
+function splitMesh(verts, tris, box) {
+  const inside = [], outside = [];
+  const [lo, hi] = box;                                // lo/hi are [x,y,z]
+  const planes = [[0,lo[0]],[0,hi[0]],[1,lo[1]],[1,hi[1]],[2,lo[2]],[2,hi[2]]];
+  for (const t of tris) {
+    let frags = [[[verts[t.a*3], verts[t.a*3+1], verts[t.a*3+2]],
+                  [verts[t.b*3], verts[t.b*3+1], verts[t.b*3+2]],
+                  [verts[t.c*3], verts[t.c*3+1], verts[t.c*3+2]]]];
+    for (const [ax, d] of planes) {
+      const out = [];
+      for (const f of frags) for (const g of splitByPlane(f, ax, d)) out.push(g);
+      frags = out;
+    }
+    for (const f of frags) {
+      const c = [0,1,2].map(i => (f[0][i] + f[1][i] + f[2][i]) / 3);
+      const ok = c[0] >= lo[0] && c[0] <= hi[0] && c[1] >= lo[1] && c[1] <= hi[1]
+              && c[2] >= lo[2] && c[2] <= hi[2];
+      (ok ? inside : outside).push({ p: f, pc: t.pc });
+    }
+  }
+  return { inside, outside };
+}
+
+/* ---------- weld + cap the open cut ---------- */
+
+function weldAndCap(frags) {
+  const key = p => p.map(v => Math.round(v * 1e4) / 1e4).join(',');
+  const idx = new Map(), V = [], T = [];
+  const vi = p => { const k = key(p); let i = idx.get(k); if (i === undefined) { i = V.length; V.push(p); idx.set(k, i); } return i; };
+  for (const f of frags) {
+    const a = vi(f.p[0]), b = vi(f.p[1]), c = vi(f.p[2]);
+    if (a !== b && b !== c && a !== c) T.push([a, b, c, f.pc]);
+  }
+  // directed edges with no opposite -> boundary
+  const dir = new Set();
+  for (const [a,b,c] of T) { dir.add(a+'_'+b); dir.add(b+'_'+c); dir.add(c+'_'+a); }
+  const next = new Map();
+  for (const e of dir) { const [a,b] = e.split('_').map(Number);
+    if (!dir.has(b+'_'+a)) { if (!next.has(a)) next.set(a, []); next.get(a).push(b); } }
+
+  const used = new Set(); let caps = 0, loops = 0;
+  for (const [s, outs] of next) for (const first of outs) {
+    if (used.has(s+'_'+first)) continue;
+    const loop = []; let u = s, v = first;
+    while (!used.has(u+'_'+v)) {
+      used.add(u+'_'+v); loop.push([u, v]);
+      const cand = (next.get(v) || []).find(w => !used.has(v+'_'+w));
+      if (cand === undefined) break;
+      u = v; v = cand;
+    }
+    if (loop.length < 3) continue;
+    loops++;
+    const ctr = [0,0,0];
+    for (const [a] of loop) for (let i = 0; i < 3; i++) ctr[i] += V[a][i] / loop.length;
+    const ci = V.length; V.push(ctr);
+    for (const [a, b] of loop) { T.push([b, a, ci, '']); caps++; }
+  }
+  return { V, T, loops, caps };
+}
+
+/* ---------- 3MF writing ---------- */
+
+const XML = s => String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+const num = v => (Math.round(v * 1e5) / 1e5).toString();
+
+function write3mf(mesh, name, srcFiles) {
+  const out = [];
+  out.push('<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" xml:lang="en-US"'
+    + ' xmlns="' + NS_C + '"'
+    + ' xmlns:BambuStudio="http://schemas.bambulab.com/package/2021"'
+    + ' xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06">\n'
+    + ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n <resources>\n'
+    + '  <object id="1" type="model">\n   <mesh>\n    <vertices>\n');
+  for (const v of mesh.V)
+    out.push('     <vertex x="' + num(v[0]) + '" y="' + num(v[1]) + '" z="' + num(v[2]) + '"/>\n');
+  out.push('    </vertices>\n    <triangles>\n');
+  for (const [a, b, c, pc] of mesh.T)
+    out.push('     <triangle v1="' + a + '" v2="' + b + '" v3="' + c + '"'
+      + (pc ? ' paint_color="' + XML(pc) + '"' : '') + '/>\n');
+  out.push('    </triangles>\n   </mesh>\n  </object>\n </resources>\n'
+    + ' <build>\n  <item objectid="1" transform="1 0 0 0 1 0 0 0 1 0 0 0" printable="1"/>\n </build>\n</model>\n');
+
+  const enc = s => fflate.strToU8(s);
+  const zip = {
+    '[Content_Types].xml': enc('<?xml version="1.0" encoding="UTF-8"?>\n'
+      + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+      + ' <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+      + ' <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>\n'
+      + ' <Default Extension="png" ContentType="image/png"/>\n</Types>\n'),
+    '_rels/.rels': enc('<?xml version="1.0" encoding="UTF-8"?>\n'
+      + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+      + ' <Relationship Target="/3D/3dmodel.model" Id="rel-1"'
+      + ' Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>\n</Relationships>\n'),
+    '3D/3dmodel.model': enc(out.join('')),
+    'Metadata/model_settings.config': enc('<?xml version="1.0" encoding="UTF-8"?>\n<config>\n'
+      + '  <object id="1">\n    <metadata key="name" value="' + XML(name) + '"/>\n'
+      + '    <metadata key="extruder" value="1"/>\n'
+      + '    <part id="1" subtype="normal_part">\n'
+      + '      <metadata key="name" value="' + XML(name) + '"/>\n'
+      + '      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>\n    </part>\n  </object>\n'
+      + '  <plate>\n    <metadata key="plater_id" value="1"/>\n    <metadata key="plater_name" value=""/>\n'
+      + '    <metadata key="locked" value="false"/>\n'
+      + '    <model_instance>\n      <metadata key="object_id" value="1"/>\n'
+      + '      <metadata key="instance_id" value="0"/>\n    </model_instance>\n  </plate>\n</config>\n')
+  };
+  // carry the printer/filament setup over so painted extruders still map to the same colours
+  const ps = 'Metadata/project_settings.config';
+  if (srcFiles[ps]) zip[ps] = srcFiles[ps];
+
+  return fflate.zipSync(zip, { level: 6 });
+}
+
+function download(bytes, filename) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'model/3mf' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+/* ---------- viewer ---------- */
+
+const view = $('#view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.localClippingEnabled = true;
+view.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14161a);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 1.05));
+const key = new THREE.DirectionalLight(0xffffff, 0.85); key.position.set(1, 1.5, 1); scene.add(key);
+
+let target = new THREE.Vector3(), dist = 300, yaw = -0.9, pitch = 0.9;
+function applyCam() {
+  camera.position.set(
+    target.x + dist * Math.sin(yaw) * Math.cos(pitch),
+    target.y - dist * Math.cos(yaw) * Math.cos(pitch),
+    target.z + dist * Math.sin(pitch));
+  camera.up.set(0, 0, 1);
+  camera.lookAt(target);
+}
+{ // hand-rolled orbit: no OrbitControls dependency
+  let drag = null;
+  const c = renderer.domElement;
+  c.addEventListener('contextmenu', e => e.preventDefault());
+  c.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
+    c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointerup', e => { drag = null; });
+  c.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    drag.x = e.clientX; drag.y = e.clientY;
+    if (drag.pan) {
+      const f = camera.getWorldDirection(new THREE.Vector3());
+      const r = new THREE.Vector3().crossVectors(camera.up, f).normalize();
+      const u = new THREE.Vector3().crossVectors(f, r).normalize();
+      target.addScaledVector(r, -dx * dist / 900).addScaledVector(u, dy * dist / 900);
+    } else {
+      yaw -= dx * 0.007;
+      pitch = Math.max(-1.5, Math.min(1.5, pitch + dy * 0.007));
+    }
+    applyCam();
+  });
+  c.addEventListener('wheel', e => { e.preventDefault();
+    dist = Math.max(5, Math.min(3000, dist * (1 + Math.sign(e.deltaY) * 0.12))); applyCam(); }, { passive: false });
+}
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+(function loop() { requestAnimationFrame(loop); renderer.render(scene, camera); })();
+
+/* ---------- app state ---------- */
+
+let DATA = null, MESH = null, BOXH = null, BASE = 'model';
+const LO = [0,0,0], HI = [0,0,0], BB = { lo: [0,0,0], hi: [0,0,0] };
+const clipPlanes = [
+  new THREE.Plane(new THREE.Vector3( 1,0,0)), new THREE.Plane(new THREE.Vector3(-1,0,0)),
+  new THREE.Plane(new THREE.Vector3(0, 1,0)), new THREE.Plane(new THREE.Vector3(0,-1,0)),
+  new THREE.Plane(new THREE.Vector3(0,0, 1)), new THREE.Plane(new THREE.Vector3(0,0,-1))];
+
+function buildSliders() {
+  const axes = ['X', 'Y', 'Z'];
+  $('#sliders').innerHTML = '';
+  for (let a = 0; a < 3; a++) for (const end of ['min', 'max']) {
+    const l = document.createElement('label'); l.className = 'rng';
+    l.innerHTML = '<span><em style="font-style:normal">' + axes[a] + ' ' + end
+      + '</em><b data-v="' + a + end + '"></b></span><input type="range" min="0" max="1000" step="1">';
+    const inp = l.querySelector('input');
+    inp.value = end === 'min' ? 0 : 1000;
+    inp.oninput = () => {
+      const t = +inp.value / 1000, v = BB.lo[a] + (BB.hi[a] - BB.lo[a]) * t;
+      if (end === 'min') LO[a] = Math.min(v, HI[a]); else HI[a] = Math.max(v, LO[a]);
+      updateBox();
+    };
+    $('#sliders').appendChild(l);
+  }
+}
+
+function updateBox() {
+  for (let a = 0; a < 3; a++) {
+    $('[data-v="' + a + 'min"]').textContent = LO[a].toFixed(1);
+    $('[data-v="' + a + 'max"]').textContent = HI[a].toFixed(1);
+  }
+  const b = new THREE.Box3(new THREE.Vector3(...LO), new THREE.Vector3(...HI));
+  if (BOXH) scene.remove(BOXH);
+  BOXH = new THREE.Box3Helper(b, 0x4f9dff); scene.add(BOXH);
+  clipPlanes[0].constant = -LO[0]; clipPlanes[1].constant =  HI[0];
+  clipPlanes[2].constant = -LO[1]; clipPlanes[3].constant =  HI[1];
+  clipPlanes[4].constant = -LO[2]; clipPlanes[5].constant =  HI[2];
+}
+
+function showMesh(data) {
+  if (MESH) { scene.remove(MESH); MESH.geometry.dispose(); }
+  const { verts, tris, palette } = data;
+  const { map, order } = colourMap(tris, palette);
+  const pos = new Float32Array(tris.length * 9), col = new Float32Array(tris.length * 9);
+  const cc = new THREE.Color();
+  tris.forEach((t, i) => {
+    cc.set(map.get(t.pc) || '#888888');
+    [t.a, t.b, t.c].forEach((vi, k) => {
+      pos[i*9 + k*3] = verts[vi*3]; pos[i*9 + k*3+1] = verts[vi*3+1]; pos[i*9 + k*3+2] = verts[vi*3+2];
+      col[i*9 + k*3] = cc.r; col[i*9 + k*3+1] = cc.g; col[i*9 + k*3+2] = cc.b;
+    });
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.computeVertexNormals(); g.computeBoundingBox();
+  MESH = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 0.62, metalness: 0.05, side: THREE.DoubleSide, clippingPlanes: null }));
+  scene.add(MESH);
+
+  const bb = g.boundingBox;
+  BB.lo = bb.min.toArray(); BB.hi = bb.max.toArray();
+  for (let a = 0; a < 3; a++) { LO[a] = BB.lo[a]; HI[a] = BB.hi[a]; }
+  target.copy(bb.getCenter(new THREE.Vector3()));
+  dist = bb.getSize(new THREE.Vector3()).length() * 1.4;
+  applyCam(); buildSliders(); updateBox();
+
+  $('#legend').innerHTML = ['', ...order].map(code =>
+    '<i><b style="background:' + (map.get(code) || '#888') + '"></b>'
+    + (code ? code : 'unpainted') + '</i>').join('');
+  for (const id of ['#reset', '#dlIn', '#dlOut']) $(id).disabled = false;
+}
+
+/* ---------- wiring ---------- */
+
+function load(file) {
+  BASE = file.name.replace(/\.3mf$/i, '');
+  log('Reading ' + file.name + ' …');
+  file.arrayBuffer().then(buf => {
+    DATA = parse3mf(buf);
+    showMesh(DATA);
+    $('#drop').classList.add('hide');
+    log(DATA.tris.length.toLocaleString() + ' triangles · '
+      + (DATA.verts.length / 3).toLocaleString() + ' vertices\n'
+      + DATA.palette.length + ' filament slots');
+  }).catch(e => { log('Error: ' + e.message); console.error(e); });
+}
+
+$('#drop').onclick = () => $('#file').click();
+$('#file').onchange = e => e.target.files[0] && load(e.target.files[0]);
+for (const ev of ['dragenter', 'dragover']) view.addEventListener(ev, e => {
+  e.preventDefault(); $('#drop').classList.remove('hide'); $('#drop').classList.add('over'); });
+view.addEventListener('dragleave', () => {
+  $('#drop').classList.remove('over');
+  if (DATA) $('#drop').classList.add('hide');
+});
+view.addEventListener('drop', e => {
+  e.preventDefault(); $('#drop').classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f) load(f); else $('#drop').classList.add('hide');
+});
+
+$('#clip').onchange = e => { if (MESH) MESH.material.clippingPlanes = e.target.checked ? clipPlanes : null; };
+$('#reset').onclick = () => {
+  for (let a = 0; a < 3; a++) { LO[a] = BB.lo[a]; HI[a] = BB.hi[a]; }
+  buildSliders(); updateBox();
+};
+
+function exportSide(which) {
+  if (!DATA) return;
+  log('Splitting …');
+  setTimeout(() => {
+    const t0 = performance.now();
+    const parts = splitMesh(DATA.verts, DATA.tris, [LO, HI]);
+    const frags = parts[which];
+    if (!frags.length) { log('That side of the box is empty.'); return; }
+    const mesh = weldAndCap(frags);
+    const name = BASE + ' (' + which + ')';
+    download(write3mf(mesh, name, DATA.files), name + '.3mf');
+    log(which + ': ' + mesh.T.length.toLocaleString() + ' triangles, '
+      + mesh.loops + ' open loop(s) capped with ' + mesh.caps + ' triangles\n'
+      + 'done in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s');
+  }, 30);
+}
+$('#dlIn').onclick  = () => exportSide('inside');
+$('#dlOut').onclick = () => exportSide('outside');
+</script>
+</body>
+</html>
