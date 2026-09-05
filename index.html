@@ -10,7 +10,8 @@
 html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 #app{display:flex;height:100%}
 #view{flex:1;position:relative;min-width:0}
-#view canvas{display:block}
+#view canvas{display:block;cursor:grab}
+#view canvas.resizing{cursor:grabbing}
 #side{width:320px;flex:none;background:var(--panel);border-left:1px solid var(--line);overflow-y:auto;padding:16px}
 h1{font-size:15px;margin:0 0 4px}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:20px 0 8px;font-weight:600}
@@ -63,7 +64,7 @@ kbd{background:#2b313a;border-radius:3px;padding:1px 5px;font:11px ui-monospace,
     <div id="legend"></div>
 
     <h2>View</h2>
-    <p class="sub" style="margin:0">Drag to orbit · wheel to zoom · <kbd>shift</kbd>+drag or right-drag to pan</p>
+    <p class="sub" style="margin:0">Drag blue face handles to resize · drag elsewhere to orbit · wheel to zoom · <kbd>shift</kbd>+drag or right-drag to pan</p>
 
     <div id="log"></div>
   </div>
@@ -316,6 +317,9 @@ scene.background = new THREE.Color(0x14161a);
 const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
 scene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 1.05));
 const key = new THREE.DirectionalLight(0xffffff, 0.85); key.position.set(1, 1.5, 1); scene.add(key);
+const resizeHandles = new THREE.Group();
+scene.add(resizeHandles);
+let resizeDrag = null;
 
 let target = new THREE.Vector3(), dist = 300, yaw = -0.9, pitch = 0.9;
 function applyCam() {
@@ -330,10 +334,41 @@ function applyCam() {
   let drag = null;
   const c = renderer.domElement;
   c.addEventListener('contextmenu', e => e.preventDefault());
-  c.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
-    c.setPointerCapture(e.pointerId); });
-  c.addEventListener('pointerup', e => { drag = null; });
+  c.addEventListener('pointerdown', e => {
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(new THREE.Vector2(
+      (e.clientX / c.clientWidth) * 2 - 1,
+      -(e.clientY / c.clientHeight) * 2 + 1), camera);
+    const hit = ray.intersectObjects(resizeHandles.children, false)[0];
+    if (hit && MESH && e.button === 0) {
+      const h = hit.object.userData;
+      const center = new THREE.Vector3((LO[0] + HI[0]) / 2, (LO[1] + HI[1]) / 2, (LO[2] + HI[2]) / 2);
+      const axis = new THREE.Vector3(); axis.setComponent(h.axis, 1);
+      const p0 = center.clone().project(camera), p1 = center.clone().add(axis).project(camera);
+      const screenAxis = new THREE.Vector2(
+        (p1.x - p0.x) * c.clientWidth / 2, -(p1.y - p0.y) * c.clientHeight / 2);
+      resizeDrag = { axis: h.axis, end: h.end, startX: e.clientX, startY: e.clientY,
+        startValue: h.end ? HI[h.axis] : LO[h.axis], screenAxis };
+      c.classList.add('resizing'); c.setPointerCapture(e.pointerId); e.preventDefault();
+      return;
+    }
+    drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
+    c.setPointerCapture(e.pointerId);
+  });
+  c.addEventListener('pointerup', e => { drag = null; resizeDrag = null; c.classList.remove('resizing'); });
+  c.addEventListener('pointercancel', e => { drag = null; resizeDrag = null; c.classList.remove('resizing'); });
   c.addEventListener('pointermove', e => {
+    if (resizeDrag) {
+      const move = new THREE.Vector2(e.clientX - resizeDrag.startX, e.clientY - resizeDrag.startY);
+      const axisLengthSq = resizeDrag.screenAxis.lengthSq();
+      // Project the pointer movement onto the selected axis in screen space.
+      // This handles horizontal, vertical, and camera-flipped axis projections.
+      const d = axisLengthSq > 1e-6 ? move.dot(resizeDrag.screenAxis) / axisLengthSq : 0;
+      const a = resizeDrag.axis, v = resizeDrag.startValue + d;
+      if (resizeDrag.end) HI[a] = Math.max(v, LO[a]); else LO[a] = Math.min(v, HI[a]);
+      updateBox();
+      return;
+    }
     if (!drag) return;
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
     drag.x = e.clientX; drag.y = e.clientY;
@@ -389,10 +424,27 @@ function updateBox() {
   for (let a = 0; a < 3; a++) {
     $('[data-v="' + a + 'min"]').textContent = LO[a].toFixed(1);
     $('[data-v="' + a + 'max"]').textContent = HI[a].toFixed(1);
+    for (const end of ['min', 'max']) {
+      const input = $('[data-v="' + a + end + '"]').parentNode.nextElementSibling;
+      const value = end === 'min' ? LO[a] : HI[a];
+      input.value = BB.hi[a] === BB.lo[a] ? 0 : Math.round((value - BB.lo[a]) / (BB.hi[a] - BB.lo[a]) * 1000);
+    }
   }
   const b = new THREE.Box3(new THREE.Vector3(...LO), new THREE.Vector3(...HI));
   if (BOXH) scene.remove(BOXH);
   BOXH = new THREE.Box3Helper(b, 0x4f9dff); scene.add(BOXH);
+  while (resizeHandles.children.length) {
+    const h = resizeHandles.children[0]; resizeHandles.remove(h); h.geometry.dispose(); h.material.dispose();
+  }
+  const size = b.getSize(new THREE.Vector3());
+  const radius = Math.max(size.length() * 0.018, 0.25);
+  for (let a = 0; a < 3; a++) for (const end of [false, true]) {
+    const p = new THREE.Vector3((LO[0] + HI[0]) / 2, (LO[1] + HI[1]) / 2, (LO[2] + HI[2]) / 2);
+    p.setComponent(a, end ? HI[a] : LO[a]);
+    const h = new THREE.Mesh(new THREE.SphereGeometry(radius, 16, 10),
+      new THREE.MeshBasicMaterial({ color: 0x4f9dff, depthTest: false }));
+    h.position.copy(p); h.renderOrder = 3; h.userData = { axis: a, end }; resizeHandles.add(h);
+  }
   clipPlanes[0].constant = -LO[0]; clipPlanes[1].constant =  HI[0];
   clipPlanes[2].constant = -LO[1]; clipPlanes[3].constant =  HI[1];
   clipPlanes[4].constant = -LO[2]; clipPlanes[5].constant =  HI[2];
